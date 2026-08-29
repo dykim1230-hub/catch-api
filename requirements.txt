@@ -1,0 +1,6 @@
+fastapi==0.115.0
+uvicorn==0.30.6
+pytrends==4.9.2
+praw==7.7.1
+firebase-admin==6.5.0
+requests==2.32.3
