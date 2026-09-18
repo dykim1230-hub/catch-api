@@ -52,35 +52,43 @@ async def cron_update(request: Request):
     cron-job.org에서 매일 08:00 KST에 호출.
     신호 수집 → buzz 점수 계산 → Firestore `catch_buzz/{YYYY-MM-DD}` 저장.
     """
-    # 보안 토큰 확인
-    token    = request.headers.get("X-Cron-Token", "")
-    expected = os.environ.get("CRON_SECRET", "")
-    if expected and token != expected:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    import traceback
+    try:
+        # 보안 토큰 확인
+        token    = request.headers.get("X-Cron-Token", "")
+        expected = os.environ.get("CRON_SECRET", "")
+        if expected and token != expected:
+            raise HTTPException(status_code=401, detail="Unauthorized")
 
-    db = get_db()
-    today     = date.today().isoformat()
-    yesterday = (date.today() - timedelta(days=1)).isoformat()
+        db = get_db()
+        today     = date.today().isoformat()
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
 
-    # 전날 데이터 로드 (delta + history 누적용)
-    prev_doc  = db.collection("catch_buzz").document(yesterday).get()
-    prev_data = {}
-    if prev_doc.exists:
-        for t in prev_doc.to_dict().get("trends", []):
-            prev_data[t["id"]] = {"score": t["score"], "history": t.get("history", [])}
+        # 전날 데이터 로드 (delta + history 누적용)
+        prev_doc  = db.collection("catch_buzz").document(yesterday).get()
+        prev_data = {}
+        if prev_doc.exists:
+            for t in prev_doc.to_dict().get("trends", []):
+                prev_data[t["id"]] = {"score": t["score"], "history": t.get("history", [])}
 
-    logger.info(f"Buzz update 시작: {today} | prev_ids: {list(prev_data.keys())}")
+        logger.info(f"Buzz update 시작: {today} | prev_ids: {list(prev_data.keys())}")
 
-    trends = run_buzz_update(prev_data)
+        trends = run_buzz_update(prev_data)
 
-    db.collection("catch_buzz").document(today).set({
-        "date": today,
-        "updated_at": fs.SERVER_TIMESTAMP,
-        "trends": trends,
-    })
+        db.collection("catch_buzz").document(today).set({
+            "date": today,
+            "updated_at": fs.SERVER_TIMESTAMP,
+            "trends": trends,
+        })
 
-    logger.info(f"Buzz update 완료: { {t['id']: t['score'] for t in trends} }")
-    return {"status": "ok", "date": today, "trends": trends}
+        logger.info(f"Buzz update 완료: { {t['id']: t['score'] for t in trends} }")
+        return {"status": "ok", "date": today, "trends": trends}
+    except HTTPException:
+        raise
+    except Exception as e:
+        err = traceback.format_exc()
+        logger.error(f"cron_update 오류:\n{err}")
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 
 @app.get("/buzz/latest")
