@@ -91,6 +91,38 @@ async def cron_update(request: Request):
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 
+@app.get("/debug/naver")
+def debug_naver():
+    """Naver API 직접 테스트 (디버그용)"""
+    import requests
+    from datetime import date, timedelta
+    naver_id     = os.environ.get("NAVER_CLIENT_ID", "")
+    naver_secret = os.environ.get("NAVER_CLIENT_SECRET", "")
+    if not naver_id:
+        return {"error": "NAVER_CLIENT_ID not set"}
+    today = date.today()
+    body = {
+        "startDate": (today - timedelta(days=7)).strftime("%Y-%m-%d"),
+        "endDate": today.strftime("%Y-%m-%d"),
+        "timeUnit": "date",
+        "keywordGroups": [{"groupName": "test", "keywords": ["패션"]}],
+    }
+    try:
+        r = requests.post(
+            "https://naverapihub.apigw.ntruss.com/search-trend/v1/search",
+            json=body,
+            headers={
+                "X-NCP-APIGW-API-KEY-ID": naver_id,
+                "X-NCP-APIGW-API-KEY": naver_secret,
+                "Content-Type": "application/json",
+            },
+            timeout=10,
+        )
+        return {"status_code": r.status_code, "response": r.json(), "key_id_prefix": naver_id[:4]}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/buzz/latest")
 def get_latest():
     """오늘(없으면 어제) buzz 데이터 반환. 디버그·수동 확인용."""
