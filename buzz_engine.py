@@ -77,11 +77,11 @@ def get_naver_signal(trend: dict, client_id: str, client_secret: str) -> float:
             ],
         }
         r = requests.post(
-            "https://openapi.naver.com/v1/datalab/search",
+            "https://naverapihub.apigw.ntruss.com/search-trend/v1/search",
             json=body,
             headers={
-                "X-Naver-Client-Id": client_id,
-                "X-Naver-Client-Secret": client_secret,
+                "X-NCP-APIGW-API-KEY-ID": client_id,
+                "X-NCP-APIGW-API-KEY": client_secret,
                 "Content-Type": "application/json",
             },
             timeout=10,
