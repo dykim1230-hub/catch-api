@@ -1,6 +1,7 @@
 """
 CATCH Buzz Engine — 신호 수집 + 점수 계산
-신호원: Google Trends (45%) · Naver DataLab (30%) · Reddit (25%)
+트렌드 목록은 Firestore catch_config/trends 에서 로드됩니다 (main.py 참조).
+신호원: Naver DataLab · Google Trends · Reddit
 """
 import os
 import time
@@ -10,39 +11,6 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-# ── 트렌드 키워드 정의 ────────────────────────────────────────────────────────
-# id는 catch-web/index.html의 TRENDS 배열 id와 반드시 일치해야 합니다.
-TRENDS_CONFIG = [
-    {
-        "id": "granola_core",
-        "name": "Granola-core",
-        "google_kw": ["granola core fashion", "gorpcore"],
-        "naver_kw": ["그래놀라코어", "고프코어"],
-        "reddit_terms": ["gorpcore", "granola core"],
-    },
-    {
-        "id": "oversized_totes",
-        "name": "Oversized Totes",
-        "google_kw": ["oversized tote bag", "tote bag korea"],
-        "naver_kw": ["오버사이즈 토트백", "빅 토트백"],
-        "reddit_terms": ["oversized tote bag", "big tote"],
-    },
-    {
-        "id": "open_back_tops",
-        "name": "Open-Back Tops",
-        "google_kw": ["open back top fashion", "backless top korean"],
-        "naver_kw": ["오픈백 탑", "백리스"],
-        "reddit_terms": ["open back top outfit", "backless top"],
-    },
-    {
-        "id": "color_liberation",
-        "name": "Color Liberation",
-        "google_kw": ["bold color fashion korea", "color blocking street style"],
-        "naver_kw": ["컬러 패션", "비비드 컬러"],
-        "reddit_terms": ["bold colors fashion", "color blocking outfit"],
-    },
-]
-
 
 # ── 신호 수집 함수 ────────────────────────────────────────────────────────────
 
@@ -50,8 +18,10 @@ def get_google_signal(trend: dict) -> float:
     """Google Trends 7일 평균 관심도 (0-100). 실패 시 -1."""
     try:
         from pytrends.request import TrendReq
+        kws = trend.get("google_kw", [])[:5]
+        if not kws:
+            return -1.0
         pt = TrendReq(hl="ko", tz=540, timeout=(10, 30), retries=2, backoff_factor=1.0)
-        kws = trend["google_kw"][:5]
         pt.build_payload(kws, cat=0, timeframe="now 7-d", geo="KR")
         df = pt.interest_over_time()
         if df.empty:
@@ -66,6 +36,9 @@ def get_naver_signal(trend: dict, client_id: str, client_secret: str) -> float:
     """Naver DataLab 검색어 트렌드 7일 평균 (0-100). API 키 없으면 -1."""
     if not client_id or not client_secret:
         return -1.0
+    naver_kw = trend.get("naver_kw", [])
+    if not naver_kw:
+        return -1.0
     try:
         today = date.today()
         body = {
@@ -73,7 +46,7 @@ def get_naver_signal(trend: dict, client_id: str, client_secret: str) -> float:
             "endDate": today.strftime("%Y-%m-%d"),
             "timeUnit": "date",
             "keywordGroups": [
-                {"groupName": trend["id"], "keywords": trend["naver_kw"][:5]}
+                {"groupName": trend["id"], "keywords": naver_kw[:5]}
             ],
         }
         r = requests.post(
@@ -110,10 +83,9 @@ def get_reddit_signal(trend: dict, client_id: str, client_secret: str) -> float:
         )
         subreddits = "streetwear+femalefashionadvice+kpopfashion+korea"
         count = 0
-        for term in trend["reddit_terms"][:2]:
+        for term in trend.get("reddit_terms", [])[:2]:
             posts = reddit.subreddit(subreddits).search(term, time_filter="week", limit=25)
             count += sum(1 for _ in posts)
-        # 최대 50개 → 100점 환산
         return float(min(count * 2, 100))
     except Exception as e:
         logger.warning(f"[Reddit] {trend['id']}: {e}")
@@ -151,24 +123,25 @@ def compute_status(score: float, delta: float):
 
 # ── 메인 업데이트 함수 ────────────────────────────────────────────────────────
 
-def run_buzz_update(prev_data: dict) -> list:
+def run_buzz_update(prev_data: dict, trends_config: list) -> list:
     """
     신호 수집 → 점수 계산 → 트렌드 리스트 반환.
     prev_data: {trend_id: {score, history}} (Firestore 전일 데이터)
+    trends_config: Firestore catch_config/trends 에서 로드한 트렌드 목록
     """
-    naver_id     = os.environ.get("NAVER_CLIENT_ID", "")
-    naver_secret = os.environ.get("NAVER_CLIENT_SECRET", "")
-    reddit_id    = os.environ.get("REDDIT_CLIENT_ID", "")
+    naver_id      = os.environ.get("NAVER_CLIENT_ID", "")
+    naver_secret  = os.environ.get("NAVER_CLIENT_SECRET", "")
+    reddit_id     = os.environ.get("REDDIT_CLIENT_ID", "")
     reddit_secret = os.environ.get("REDDIT_CLIENT_SECRET", "")
 
     google_raw, naver_raw, reddit_raw = [], [], []
 
-    for trend in TRENDS_CONFIG:
+    for trend in trends_config:
         logger.info(f"Collecting: {trend['id']}")
 
         g = get_google_signal(trend)
         google_raw.append(g)
-        time.sleep(2)  # Google rate limit 방지
+        time.sleep(2)
 
         n = get_naver_signal(trend, naver_id, naver_secret)
         naver_raw.append(n)
@@ -176,17 +149,15 @@ def run_buzz_update(prev_data: dict) -> list:
         r = get_reddit_signal(trend, reddit_id, reddit_secret)
         reddit_raw.append(r)
 
-    # 각 신호 배치 정규화
     g_norm = normalize_batch(google_raw)
     n_norm = normalize_batch(naver_raw)
     r_norm = normalize_batch(reddit_raw)
 
-    # 사용 가능한 소스 기반 가중치 재조정
     has_naver  = any(s >= 0 for s in naver_raw)
     has_reddit = any(s >= 0 for s in reddit_raw)
 
     results = []
-    for i, trend in enumerate(TRENDS_CONFIG):
+    for i, trend in enumerate(trends_config):
         if has_naver and has_reddit:
             raw = g_norm[i] * 0.45 + n_norm[i] * 0.30 + r_norm[i] * 0.25
         elif has_naver:
@@ -198,30 +169,31 @@ def run_buzz_update(prev_data: dict) -> list:
 
         score = round(raw)
 
-        # delta 계산 (전일 점수 기준)
         prev_score = prev_data.get(trend["id"], {}).get("score", score)
         delta = round(score - prev_score)
         status, status_label = compute_status(score, delta)
 
-        # 7일 히스토리 누적 (스파크 차트용)
         prev_history = prev_data.get(trend["id"], {}).get("history", [])
         history = (prev_history[-6:] if prev_history else []) + [score]
 
         results.append({
-            "id": trend["id"],
-            "score": score,
-            "delta": delta,
-            "status": status,
+            "id":           trend["id"],
+            "name":         trend.get("name", trend["id"]),
+            "description":  trend.get("description", ""),
+            "see_it_kw":    trend.get("see_it_kw", trend.get("name", "") + " korean fashion"),
+            "spotted_on":   trend.get("spotted_on"),
+            "score":        score,
+            "delta":        delta,
+            "status":       status,
             "status_label": status_label,
-            "history": history,
+            "history":      history,
             "signals": {
                 "google": round(google_raw[i], 1),
-                "naver": round(naver_raw[i], 1),
+                "naver":  round(naver_raw[i], 1),
                 "reddit": round(reddit_raw[i], 1),
             },
         })
 
-    # 점수 내림차순 정렬 → rank, hero 부여
     results.sort(key=lambda x: x["score"], reverse=True)
     for i, r in enumerate(results):
         r["rank"] = i + 1
