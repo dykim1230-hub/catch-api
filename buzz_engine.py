@@ -70,22 +70,20 @@ def get_naver_signal(trend: dict, client_id: str, client_secret: str) -> float:
         return -1.0
 
 
-def get_reddit_signal(trend: dict, client_id: str, client_secret: str) -> float:
-    """Reddit 관련 서브레딧 7일 언급 수 → 0-100 환산. API 키 없으면 -1."""
-    if not client_id or not client_secret:
-        return -1.0
+def get_reddit_signal(trend: dict, client_id: str = "", client_secret: str = "") -> float:
+    """Reddit 공개 JSON API로 7일 언급 수 → 0-100 환산. 앱 등록 불필요."""
     try:
-        import praw
-        reddit = praw.Reddit(
-            client_id=client_id,
-            client_secret=client_secret,
-            user_agent="catch-fashion-radar/1.0",
-        )
-        subreddits = "streetwear+femalefashionadvice+kpopfashion+korea"
+        headers = {"User-Agent": "catch-fashion-radar/1.0"}
         count = 0
         for term in trend.get("reddit_terms", [])[:2]:
-            posts = reddit.subreddit(subreddits).search(term, time_filter="week", limit=25)
-            count += sum(1 for _ in posts)
+            url = (
+                "https://www.reddit.com/search.json"
+                f"?q={requests.utils.quote(term)}&sort=new&t=week&limit=25"
+            )
+            r = requests.get(url, headers=headers, timeout=10)
+            r.raise_for_status()
+            count += r.json().get("data", {}).get("dist", 0)
+            time.sleep(1)
         return float(min(count * 2, 100))
     except Exception as e:
         logger.warning(f"[Reddit] {trend['id']}: {e}")
@@ -131,8 +129,6 @@ def run_buzz_update(prev_data: dict, trends_config: list) -> list:
     """
     naver_id      = os.environ.get("NAVER_CLIENT_ID", "")
     naver_secret  = os.environ.get("NAVER_CLIENT_SECRET", "")
-    reddit_id     = os.environ.get("REDDIT_CLIENT_ID", "")
-    reddit_secret = os.environ.get("REDDIT_CLIENT_SECRET", "")
 
     google_raw, naver_raw, reddit_raw = [], [], []
 
@@ -146,7 +142,7 @@ def run_buzz_update(prev_data: dict, trends_config: list) -> list:
         n = get_naver_signal(trend, naver_id, naver_secret)
         naver_raw.append(n)
 
-        r = get_reddit_signal(trend, reddit_id, reddit_secret)
+        r = get_reddit_signal(trend)
         reddit_raw.append(r)
 
     g_norm = normalize_batch(google_raw)
