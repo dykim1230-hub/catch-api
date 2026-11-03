@@ -11,6 +11,10 @@ import requests
 
 logger = logging.getLogger(__name__)
 
+NAVER_MAX_GROUPS = 5
+NAVER_PERIOD_DAYS = 8  # startDate~endDate 양 끝 포함
+WEIGHTS = {"google": 0.45, "naver": 0.30, "reddit": 0.25}
+
 
 # ── 신호 수집 함수 ────────────────────────────────────────────────────────────
 
@@ -32,21 +36,29 @@ def get_google_signal(trend: dict) -> float:
         return -1.0
 
 
-def get_naver_signal(trend: dict, client_id: str, client_secret: str) -> float:
-    """Naver DataLab 검색어 트렌드 7일 평균 (0-100). API 키 없으면 -1."""
+def get_naver_signals(trends: list, client_id: str, client_secret: str) -> list:
+    """
+    Naver DataLab 7일 평균 (0-100). 실패·미수집 트렌드는 -1.
+    DataLab 비율은 요청 안의 최댓값이 100인 상대값이라, 트렌드끼리 비교하려면
+    한 요청에 함께 넣어야 한다. 한 요청 최대 5그룹이므로 초과분은 수집하지 않는다.
+    """
+    signals = [-1.0] * len(trends)
     if not client_id or not client_secret:
-        return -1.0
-    naver_kw = trend.get("naver_kw", [])
-    if not naver_kw:
-        return -1.0
+        return signals
+    targets = [(i, t) for i, t in enumerate(trends) if t.get("naver_kw")]
+    if len(targets) > NAVER_MAX_GROUPS:
+        logger.warning(f"[Naver DataLab] 트렌드 {len(targets)}개 중 {NAVER_MAX_GROUPS}개만 수집")
+        targets = targets[:NAVER_MAX_GROUPS]
+    if not targets:
+        return signals
     try:
         today = date.today()
         body = {
-            "startDate": (today - timedelta(days=7)).strftime("%Y-%m-%d"),
+            "startDate": (today - timedelta(days=NAVER_PERIOD_DAYS - 1)).strftime("%Y-%m-%d"),
             "endDate": today.strftime("%Y-%m-%d"),
             "timeUnit": "date",
             "keywordGroups": [
-                {"groupName": trend["id"], "keywords": naver_kw[:5]}
+                {"groupName": t["id"], "keywords": t["naver_kw"][:5]} for _, t in targets
             ],
         }
         r = requests.post(
@@ -60,22 +72,27 @@ def get_naver_signal(trend: dict, client_id: str, client_secret: str) -> float:
             timeout=10,
         )
         r.raise_for_status()
-        results = r.json().get("results", [])
-        if not results:
-            return -1.0
-        ratios = [item["ratio"] for item in results[0]["data"]]
-        return float(sum(ratios) / len(ratios)) if ratios else -1.0
+        by_id = {item["title"]: item["data"] for item in r.json().get("results", [])}
+        for i, t in targets:
+            ratios = [point["ratio"] for point in by_id.get(t["id"], [])]
+            if ratios:
+                # 검색량이 없는 날은 응답에서 빠지므로 기간 전체 일수로 나눈다
+                signals[i] = float(sum(ratios) / NAVER_PERIOD_DAYS)
     except Exception as e:
-        logger.warning(f"[Naver DataLab] {trend['id']}: {e}")
-        return -1.0
+        logger.warning(f"[Naver DataLab] {e}")
+    return signals
 
 
 def get_reddit_signal(trend: dict, client_id: str = "", client_secret: str = "") -> float:
     """Reddit 공개 JSON API로 7일 언급 수 → 0-100 환산. 앱 등록 불필요."""
+    # Gemini가 만든 기존 트렌드에는 reddit_terms가 없을 수 있어 google_kw로 대체
+    terms = trend.get("reddit_terms") or trend.get("google_kw") or []
+    if not terms:
+        return -1.0
     try:
         headers = {"User-Agent": "catch-fashion-radar/1.0"}
         count = 0
-        for term in trend.get("reddit_terms", [])[:2]:
+        for term in terms[:2]:
             url = (
                 "https://www.reddit.com/search.json"
                 f"?q={requests.utils.quote(term)}&sort=new&t=week&limit=25"
@@ -90,20 +107,15 @@ def get_reddit_signal(trend: dict, client_id: str = "", client_secret: str = "")
         return -1.0
 
 
-# ── 정규화 + 점수 계산 ────────────────────────────────────────────────────────
+# ── 점수 계산 ────────────────────────────────────────────────────────
 
-def normalize_batch(scores: list) -> list:
-    """배치 내 유효값 min-max 정규화 (0-100). -1은 중간값(50)으로 채움."""
-    valid = [s for s in scores if s >= 0]
-    if not valid:
-        return [50.0] * len(scores)
-    mn, mx = min(valid), max(valid)
-    if mx == mn:
-        return [50.0] * len(scores)
-    return [
-        50.0 if s < 0 else round((s - mn) / (mx - mn) * 100, 1)
-        for s in scores
-    ]
+def compute_score(signals: dict):
+    """수집된 신호만 가중 평균(가중치 재분배). 신호가 하나도 없으면 None."""
+    available = {k: v for k, v in signals.items() if v >= 0}
+    if not available:
+        return None
+    total = sum(WEIGHTS[k] for k in available)
+    return round(sum(v * WEIGHTS[k] for k, v in available.items()) / total)
 
 
 def compute_status(score: float, delta: float):
@@ -121,49 +133,34 @@ def compute_status(score: float, delta: float):
 
 # ── 메인 업데이트 함수 ────────────────────────────────────────────────────────
 
-def run_buzz_update(prev_data: dict, trends_config: list) -> list:
+def run_buzz_update(prev_data: dict, trends_config: list):
     """
-    신호 수집 → 점수 계산 → 트렌드 리스트 반환.
-    prev_data: {trend_id: {score, history}} (Firestore 전일 데이터)
+    신호 수집 → 점수 계산 → (점수 있는 트렌드 리스트, 신호 없는 트렌드 id 리스트) 반환.
+    prev_data: {trend_id: {score, history}} (Firestore 직전 데이터)
     trends_config: Firestore catch_config/trends 에서 로드한 트렌드 목록
     """
     naver_id      = os.environ.get("NAVER_CLIENT_ID", "")
     naver_secret  = os.environ.get("NAVER_CLIENT_SECRET", "")
 
-    google_raw, naver_raw, reddit_raw = [], [], []
+    google_raw, reddit_raw = [], []
 
     for trend in trends_config:
         logger.info(f"Collecting: {trend['id']}")
 
-        g = get_google_signal(trend)
-        google_raw.append(g)
+        google_raw.append(get_google_signal(trend))
         time.sleep(2)
 
-        n = get_naver_signal(trend, naver_id, naver_secret)
-        naver_raw.append(n)
+        reddit_raw.append(get_reddit_signal(trend))
 
-        r = get_reddit_signal(trend)
-        reddit_raw.append(r)
+    naver_raw = get_naver_signals(trends_config, naver_id, naver_secret)
 
-    g_norm = normalize_batch(google_raw)
-    n_norm = normalize_batch(naver_raw)
-    r_norm = normalize_batch(reddit_raw)
-
-    has_naver  = any(s >= 0 for s in naver_raw)
-    has_reddit = any(s >= 0 for s in reddit_raw)
-
-    results = []
+    results, insufficient = [], []
     for i, trend in enumerate(trends_config):
-        if has_naver and has_reddit:
-            raw = g_norm[i] * 0.45 + n_norm[i] * 0.30 + r_norm[i] * 0.25
-        elif has_naver:
-            raw = g_norm[i] * 0.60 + n_norm[i] * 0.40
-        elif has_reddit:
-            raw = g_norm[i] * 0.60 + r_norm[i] * 0.40
-        else:
-            raw = g_norm[i]
-
-        score = round(raw)
+        signals = {"google": google_raw[i], "naver": naver_raw[i], "reddit": reddit_raw[i]}
+        score = compute_score(signals)
+        if score is None:
+            insufficient.append(trend["id"])
+            continue
 
         prev_score = prev_data.get(trend["id"], {}).get("score", score)
         delta = round(score - prev_score)
@@ -183,11 +180,7 @@ def run_buzz_update(prev_data: dict, trends_config: list) -> list:
             "status":       status,
             "status_label": status_label,
             "history":      history,
-            "signals": {
-                "google": round(google_raw[i], 1),
-                "naver":  round(naver_raw[i], 1),
-                "reddit": round(reddit_raw[i], 1),
-            },
+            "signals": {k: round(v, 1) for k, v in signals.items()},
         })
 
     results.sort(key=lambda x: x["score"], reverse=True)
@@ -195,4 +188,4 @@ def run_buzz_update(prev_data: dict, trends_config: list) -> list:
         r["rank"] = i + 1
         r["hero"] = (i == 0)
 
-    return results
+    return results, insufficient

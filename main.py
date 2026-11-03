@@ -9,7 +9,7 @@ import os
 import json
 import base64
 import logging
-from datetime import date, timedelta
+from datetime import date
 
 from fastapi import FastAPI, HTTPException, Request
 import firebase_admin
@@ -69,6 +69,7 @@ DEFAULT_TRENDS = [
 
 # ── Firebase 초기화 ───────────────────────────────────────────────────────────
 _db = None
+PREV_MAX_AGE_DAYS = 14
 
 def get_db():
     global _db
@@ -99,6 +100,29 @@ def load_trends_config(db) -> list:
     return DEFAULT_TRENDS
 
 
+def load_prev_data(db, today: date) -> dict:
+    """
+    오늘 이전의 가장 최근 문서를 변화량 기준으로 읽는다.
+    PREV_MAX_AGE_DAYS보다 오래됐으면 "this week" 변화량이 될 수 없어 기준 없이 시작.
+    """
+    docs = (
+        db.collection("catch_buzz")
+        .order_by("__name__", direction="DESCENDING")
+        .limit(2)
+        .stream()
+    )
+    for doc in docs:
+        if doc.id >= today.isoformat():
+            continue
+        if (today - date.fromisoformat(doc.id)).days > PREV_MAX_AGE_DAYS:
+            return {}
+        return {
+            t["id"]: {"score": t["score"], "history": t.get("history", [])}
+            for t in doc.to_dict().get("trends", [])
+        }
+    return {}
+
+
 # ── 엔드포인트 ────────────────────────────────────────────────────────────────
 
 @app.get("/")
@@ -109,7 +133,7 @@ def health():
 @app.post("/cron/update")
 async def cron_update(request: Request):
     """
-    cron-job.org에서 매일 08:00 KST에 호출.
+    GitHub Actions에서 주 1회 호출 (.github/workflows/buzz-update.yml).
     신호 수집 → buzz 점수 계산 → Firestore `catch_buzz/{YYYY-MM-DD}` 저장.
     """
     import traceback
@@ -121,29 +145,29 @@ async def cron_update(request: Request):
             raise HTTPException(status_code=401, detail="Unauthorized")
 
         db = get_db()
-        today     = date.today().isoformat()
-        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        today = date.today().isoformat()
 
-        # 전날 데이터 로드 (delta + history 누적용)
-        prev_doc  = db.collection("catch_buzz").document(yesterday).get()
-        prev_data = {}
-        if prev_doc.exists:
-            for t in prev_doc.to_dict().get("trends", []):
-                prev_data[t["id"]] = {"score": t["score"], "history": t.get("history", [])}
+        # 직전 데이터 로드 (delta + history 누적용)
+        prev_data = load_prev_data(db, date.today())
 
         logger.info(f"Buzz update 시작: {today} | prev_ids: {list(prev_data.keys())}")
 
         trends_config = load_trends_config(db)
-        trends = run_buzz_update(prev_data, trends_config)
+        trends, insufficient = run_buzz_update(prev_data, trends_config)
+
+        # 전부 수집 실패면 저장하지 않아 사이트가 직전 데이터를 유지하게 한다
+        if not trends:
+            raise RuntimeError(f"모든 트렌드 신호 수집 실패: {insufficient}")
 
         db.collection("catch_buzz").document(today).set({
             "date": today,
             "updated_at": fs.SERVER_TIMESTAMP,
             "trends": trends,
+            "insufficient_data": insufficient,
         })
 
         logger.info(f"Buzz update 완료: { {t['id']: t['score'] for t in trends} }")
-        return {"status": "ok", "date": today, "trends": trends}
+        return {"status": "ok", "date": today, "trends": trends, "insufficient_data": insufficient}
     except HTTPException:
         raise
     except Exception as e:
@@ -186,6 +210,7 @@ Return ONLY a JSON array, no explanation, no markdown code blocks:
     "description": "One casual English sentence (max 25 words) — what the look is and why it is popular.",
     "naver_kw": ["한국어키워드1", "한국어키워드2"],
     "google_kw": ["english keyword 1", "english keyword 2"],
+    "reddit_terms": ["english search term 1", "english search term 2"],
     "see_it_kw": "search term for Google Images",
     "spotted_on": "short description like a girl-group idol or a drama lead or null"
   }}
@@ -227,10 +252,14 @@ Return ONLY a JSON array, no explanation, no markdown code blocks:
 
 @app.get("/buzz/latest")
 def get_latest():
-    """오늘(없으면 어제) buzz 데이터 반환. 디버그·수동 확인용."""
+    """가장 최근 buzz 데이터 반환. 디버그·수동 확인용."""
     db = get_db()
-    for d in [date.today().isoformat(), (date.today() - timedelta(days=1)).isoformat()]:
-        doc = db.collection("catch_buzz").document(d).get()
-        if doc.exists:
-            return doc.to_dict()
+    docs = (
+        db.collection("catch_buzz")
+        .order_by("__name__", direction="DESCENDING")
+        .limit(1)
+        .stream()
+    )
+    for doc in docs:
+        return doc.to_dict()
     return {"error": "데이터 없음 — /cron/update를 먼저 실행하세요."}
