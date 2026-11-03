@@ -1,0 +1,20 @@
+name: Weekly buzz update
+
+on:
+  schedule:
+    - cron: '5 0 * * 0'  # 매주 일요일 00:05 UTC (09:05 KST)
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Call /cron/update
+        env:
+          CRON_TOKEN: ${{ secrets.CRON_SECRET }}
+        run: |
+          curl --fail-with-body --silent --show-error \
+            --max-time 600 --retry 2 --retry-delay 60 --retry-all-errors \
+            -X POST -H "X-Cron-Token: $CRON_TOKEN" \
+            https://catch-api-xin9.onrender.com/cron/update
