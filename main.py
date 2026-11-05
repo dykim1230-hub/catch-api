@@ -210,7 +210,7 @@ async def cron_update(request: Request):
 @app.post("/cron/refresh-trends")
 async def refresh_trends(request: Request, dry_run: bool = False):
     """
-    Gemini와 Google 검색으로 최근에 쓰지 않은 K-패션 트렌드를 뽑아 catch_config/trends 에 저장한다.
+    네이버 뉴스·블로그 근거로 Gemini가 최근에 쓰지 않은 K-패션 트렌드를 골라 catch_config/trends 에 저장한다.
     dry_run=true 면 저장하지 않고 결과만 반환한다.
     """
     import traceback
@@ -228,7 +228,7 @@ async def refresh_trends(request: Request, dry_run: bool = False):
         db = get_db()
         excluded_ids, excluded_names = load_recent_trends(db, today)
 
-        new_trends, sources = pick_trends(
+        new_trends = pick_trends(
             google_genai.Client(api_key=api_key),
             today,
             excluded_ids,
@@ -242,7 +242,6 @@ async def refresh_trends(request: Request, dry_run: bool = False):
                 "updated_at":   fs.SERVER_TIMESTAMP,
                 "updated_date": today.isoformat(),
                 "trends":       new_trends,
-                "sources":      sources,
             })
 
         logger.info(f"트렌드 갱신 완료 (dry_run={dry_run}): {[t['name'] for t in new_trends]}")
@@ -252,7 +251,6 @@ async def refresh_trends(request: Request, dry_run: bool = False):
             "updated_date": today.isoformat(),
             "excluded_ids": sorted(excluded_ids),
             "trends": new_trends,
-            "sources": sources,
         }
 
     except HTTPException:
