@@ -1,7 +1,7 @@
 """
 CATCH Buzz Engine — 신호 수집 + 점수 계산
 트렌드 목록은 Firestore catch_config/trends 에서 로드됩니다 (main.py 참조).
-신호원: Naver DataLab · Google Trends · Reddit
+신호원: Naver DataLab · Google Trends
 """
 import os
 import time
@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 NAVER_MAX_GROUPS = 5
 NAVER_PERIOD_DAYS = 8  # startDate~endDate 양 끝 포함
-WEIGHTS = {"google": 0.45, "naver": 0.30, "reddit": 0.25}
+WEIGHTS = {"google": 0.60, "naver": 0.40}
 
 
 # ── 신호 수집 함수 ────────────────────────────────────────────────────────────
@@ -83,30 +83,6 @@ def get_naver_signals(trends: list, client_id: str, client_secret: str) -> list:
     return signals
 
 
-def get_reddit_signal(trend: dict, client_id: str = "", client_secret: str = "") -> float:
-    """Reddit 공개 JSON API로 7일 언급 수 → 0-100 환산. 앱 등록 불필요."""
-    # Gemini가 만든 기존 트렌드에는 reddit_terms가 없을 수 있어 google_kw로 대체
-    terms = trend.get("reddit_terms") or trend.get("google_kw") or []
-    if not terms:
-        return -1.0
-    try:
-        headers = {"User-Agent": "catch-fashion-radar/1.0"}
-        count = 0
-        for term in terms[:2]:
-            url = (
-                "https://www.reddit.com/search.json"
-                f"?q={requests.utils.quote(term)}&sort=new&t=week&limit=25"
-            )
-            r = requests.get(url, headers=headers, timeout=10)
-            r.raise_for_status()
-            count += r.json().get("data", {}).get("dist", 0)
-            time.sleep(1)
-        return float(min(count * 2, 100))
-    except Exception as e:
-        logger.warning(f"[Reddit] {trend['id']}: {e}")
-        return -1.0
-
-
 # ── 점수 계산 ────────────────────────────────────────────────────────
 
 def compute_score(signals: dict):
@@ -142,7 +118,7 @@ def run_buzz_update(prev_data: dict, trends_config: list):
     naver_id      = os.environ.get("NAVER_CLIENT_ID", "")
     naver_secret  = os.environ.get("NAVER_CLIENT_SECRET", "")
 
-    google_raw, reddit_raw = [], []
+    google_raw = []
 
     for trend in trends_config:
         logger.info(f"Collecting: {trend['id']}")
@@ -150,13 +126,11 @@ def run_buzz_update(prev_data: dict, trends_config: list):
         google_raw.append(get_google_signal(trend))
         time.sleep(2)
 
-        reddit_raw.append(get_reddit_signal(trend))
-
     naver_raw = get_naver_signals(trends_config, naver_id, naver_secret)
 
     results, insufficient = [], []
     for i, trend in enumerate(trends_config):
-        signals = {"google": google_raw[i], "naver": naver_raw[i], "reddit": reddit_raw[i]}
+        signals = {"google": google_raw[i], "naver": naver_raw[i]}
         score = compute_score(signals)
         if score is None:
             insufficient.append(trend["id"])

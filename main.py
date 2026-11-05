@@ -33,7 +33,6 @@ DEFAULT_TRENDS = [
         "spotted_on": "a boy-group idol",
         "google_kw": ["granola core fashion", "gorpcore"],
         "naver_kw": ["그래놀라코어", "고프코어"],
-        "reddit_terms": ["gorpcore", "granola core"],
     },
     {
         "id": "oversized_totes",
@@ -43,7 +42,6 @@ DEFAULT_TRENDS = [
         "spotted_on": "a Seoul Fashion Week guest",
         "google_kw": ["oversized tote bag", "tote bag korea"],
         "naver_kw": ["오버사이즈 토트백", "빅 토트백"],
-        "reddit_terms": ["oversized tote bag", "big tote"],
     },
     {
         "id": "open_back_tops",
@@ -53,7 +51,6 @@ DEFAULT_TRENDS = [
         "spotted_on": "a girl-group idol",
         "google_kw": ["open back top fashion", "backless top korean"],
         "naver_kw": ["오픈백 탑", "백리스"],
-        "reddit_terms": ["open back top outfit", "backless top"],
     },
     {
         "id": "color_liberation",
@@ -63,7 +60,6 @@ DEFAULT_TRENDS = [
         "spotted_on": "a drama lead",
         "google_kw": ["bold color fashion korea", "color blocking street style"],
         "naver_kw": ["컬러 패션", "비비드 컬러"],
-        "reddit_terms": ["bold colors fashion", "color blocking outfit"],
     },
 ]
 
@@ -210,7 +206,6 @@ Return ONLY a JSON array, no explanation, no markdown code blocks:
     "description": "One casual English sentence (max 25 words) — what the look is and why it is popular.",
     "naver_kw": ["한국어키워드1", "한국어키워드2"],
     "google_kw": ["english keyword 1", "english keyword 2"],
-    "reddit_terms": ["english search term 1", "english search term 2"],
     "see_it_kw": "search term for Google Images",
     "spotted_on": "short description like a girl-group idol or a drama lead or null"
   }}
