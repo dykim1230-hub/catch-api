@@ -1,0 +1,18 @@
+name: Trend refresh preview
+
+on:
+  workflow_dispatch:
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Call /cron/refresh-trends without saving
+        env:
+          CRON_TOKEN: ${{ secrets.CRON_SECRET }}
+        run: |
+          curl --fail-with-body --silent --show-error \
+            --max-time 300 \
+            -X POST -H "X-Cron-Token: $CRON_TOKEN" \
+            "https://catch-api-xin9.onrender.com/cron/refresh-trends?dry_run=true"

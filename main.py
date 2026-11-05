@@ -9,7 +9,7 @@ import os
 import json
 import base64
 import logging
-from datetime import date
+from datetime import date, timedelta
 
 from fastapi import FastAPI, HTTPException, Request
 import firebase_admin
@@ -17,6 +17,7 @@ from firebase_admin import credentials, firestore as fs
 import google.genai as google_genai
 
 from buzz_engine import run_buzz_update
+from trend_picker import normalize_name, pick_trends
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -66,6 +67,8 @@ DEFAULT_TRENDS = [
 # ── Firebase 초기화 ───────────────────────────────────────────────────────────
 _db = None
 PREV_MAX_AGE_DAYS = 14
+TREND_EXCLUDE_DAYS = 56
+TREND_HISTORY_DOCS = 30  # 수동 실행으로 문서가 늘어도 제외 기간을 덮을 만큼
 
 def get_db():
     global _db
@@ -117,6 +120,37 @@ def load_prev_data(db, today: date) -> dict:
             for t in doc.to_dict().get("trends", [])
         }
     return {}
+
+
+def load_recent_trends(db, today: date) -> tuple:
+    """현재 목록과 최근 TREND_EXCLUDE_DAYS일 안에 쓴 트렌드의 (id 집합, 이름 목록)을 반환한다."""
+    ids, names = set(), set()
+
+    def add(trend):
+        ids.add(trend["id"])
+        if trend.get("name"):
+            names.add(trend["name"])
+
+    config = db.collection("catch_config").document("trends").get()
+    if config.exists:
+        for trend in config.to_dict().get("trends", []):
+            add(trend)
+
+    docs = (
+        db.collection("catch_buzz")
+        .order_by("__name__", direction="DESCENDING")
+        .limit(TREND_HISTORY_DOCS)
+        .stream()
+    )
+    cutoff = (today - timedelta(days=TREND_EXCLUDE_DAYS)).isoformat()
+    for doc in docs:
+        if doc.id < cutoff:
+            break
+        data = doc.to_dict()
+        for trend in data.get("trends", []):
+            add(trend)
+        ids.update(data.get("insufficient_data", []))
+    return ids, names
 
 
 # ── 엔드포인트 ────────────────────────────────────────────────────────────────
@@ -174,10 +208,10 @@ async def cron_update(request: Request):
 
 
 @app.post("/cron/refresh-trends")
-async def refresh_trends(request: Request):
+async def refresh_trends(request: Request, dry_run: bool = False):
     """
-    Gemini로 K-패션 트렌드 5개 자동 생성 → Firestore catch_config/trends 저장.
-    주 1회 호출 권장 (매주 월요일 등).
+    Gemini와 Google 검색으로 최근에 쓰지 않은 K-패션 트렌드를 뽑아 catch_config/trends 에 저장한다.
+    dry_run=true 면 저장하지 않고 결과만 반환한다.
     """
     import traceback
     try:
@@ -191,51 +225,35 @@ async def refresh_trends(request: Request):
             raise HTTPException(status_code=500, detail="GEMINI_API_KEY not set")
 
         today = date.today()
-        month = today.month
-        season = "Spring" if month in [3,4,5] else "Summer" if month in [6,7,8] else "Autumn" if month in [9,10,11] else "Winter"
-
-        prompt = f"""Today is {today.isoformat()} (Seoul, Korea). Season: {season}.
-You are a K-fashion trend curator. Generate exactly 5 K-fashion trends currently popular in Seoul street style.
-Consider the current season and recent runway and street style trends.
-
-Return ONLY a JSON array, no explanation, no markdown code blocks:
-[
-  {{
-    "id": "snake_case_id",
-    "name": "Trend Name in English",
-    "description": "One casual English sentence (max 25 words) — what the look is and why it is popular.",
-    "naver_kw": ["한국어키워드1", "한국어키워드2"],
-    "google_kw": ["english keyword 1", "english keyword 2"],
-    "see_it_kw": "search term for Google Images",
-    "spotted_on": "short description like a girl-group idol or a drama lead or null"
-  }}
-]"""
-
-        client = google_genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model="gemini-3.6-flash",
-            contents=prompt,
-        )
-        raw = response.text.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        raw = raw.strip()
-
-        new_trends = json.loads(raw)
-        if not isinstance(new_trends, list) or len(new_trends) == 0:
-            raise ValueError("Gemini가 올바른 배열을 반환하지 않음")
-
         db = get_db()
-        db.collection("catch_config").document("trends").set({
-            "updated_at":   fs.SERVER_TIMESTAMP,
-            "updated_date": today.isoformat(),
-            "trends":       new_trends,
-        })
+        excluded_ids, excluded_names = load_recent_trends(db, today)
 
-        logger.info(f"트렌드 갱신 완료: {[t['name'] for t in new_trends]}")
-        return {"status": "ok", "updated_date": today.isoformat(), "trends": new_trends}
+        new_trends, sources = pick_trends(
+            google_genai.Client(api_key=api_key),
+            today,
+            excluded_ids,
+            {normalize_name(name) for name in excluded_names},
+            os.environ.get("NAVER_CLIENT_ID", ""),
+            os.environ.get("NAVER_CLIENT_SECRET", ""),
+        )
+
+        if not dry_run:
+            db.collection("catch_config").document("trends").set({
+                "updated_at":   fs.SERVER_TIMESTAMP,
+                "updated_date": today.isoformat(),
+                "trends":       new_trends,
+                "sources":      sources,
+            })
+
+        logger.info(f"트렌드 갱신 완료 (dry_run={dry_run}): {[t['name'] for t in new_trends]}")
+        return {
+            "status": "ok",
+            "dry_run": dry_run,
+            "updated_date": today.isoformat(),
+            "excluded_ids": sorted(excluded_ids),
+            "trends": new_trends,
+            "sources": sources,
+        }
 
     except HTTPException:
         raise
