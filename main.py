@@ -263,37 +263,6 @@ async def refresh_trends(request: Request, dry_run: bool = False):
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 
-@app.post("/debug/gemini")
-async def debug_gemini(request: Request):
-    """임시 진단용(2차): 모델별 Google 검색 호출 결과만 반환한다. 저장하지 않는다."""
-    expected = os.environ.get("CRON_SECRET", "")
-    if not expected or request.headers.get("X-Cron-Token", "") != expected:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    client = google_genai.Client(api_key=os.environ.get("GEMINI_API_KEY", ""))
-    try:
-        models = sorted(m.name for m in client.models.list() if "flash" in m.name)
-    except Exception as e:
-        models = [f"{type(e).__name__}: {e}"[:300]]
-
-    results = []
-    for model, search in [
-        ("gemini-3.5-flash", True),
-        ("gemini-3.7-flash", True),
-        ("gemini-3.8-flash", True),
-        ("gemini-flash-latest", True),
-    ]:
-        config = google_genai.types.GenerateContentConfig(
-            tools=[google_genai.types.Tool(google_search=google_genai.types.GoogleSearch())] if search else None,
-        )
-        try:
-            client.models.generate_content(model=model, contents="Reply with OK.", config=config)
-            results.append({"model": model, "search": search, "ok": True})
-        except Exception as e:
-            results.append({"model": model, "search": search, "ok": False, "error": f"{type(e).__name__}: {e}"[:600]})
-    return {"flash_models": models, "results": results}
-
-
 @app.get("/buzz/latest")
 def get_latest():
     """가장 최근 buzz 데이터 반환. 디버그·수동 확인용."""
