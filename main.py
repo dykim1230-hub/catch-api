@@ -212,6 +212,7 @@ async def refresh_trends(request: Request, dry_run: bool = False):
     """
     네이버 뉴스·블로그 근거로 Gemini가 최근에 쓰지 않은 K-패션 트렌드를 골라 catch_config/trends 에 저장한다.
     dry_run=true 면 저장하지 않고 결과만 반환한다.
+    Gemini 모델이 과부하면 다른 모델로 넘어간다.
     """
     import traceback
     try:

@@ -6,17 +6,21 @@ import html
 import json
 import logging
 import re
+import time
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 
 import requests
-from google.genai import types
+from google.genai import errors, types
 
 from buzz_engine import get_naver_weekly
 
 logger = logging.getLogger(__name__)
 
-MODEL = "gemini-3.6-flash"
+# 과부하(503)가 흔해 차례로 시도한다
+MODELS = ["gemini-3.6-flash", "gemini-3.8-flash", "gemini-3.5-flash"]
+OVERLOAD_ROUNDS = 2
+OVERLOAD_WAIT_SECONDS = 30
 MIN_TRENDS = 3
 MAX_ATTEMPTS = 2
 MIN_EVIDENCE = 10
@@ -200,6 +204,24 @@ def clean_trends(candidates: list, excluded_ids: set, excluded_names: set, evide
     return cleaned
 
 
+def generate(client, prompt: str) -> str:
+    """과부하면 다른 모델로 넘어가고, 모두 과부하면 잠시 뒤 한 번 더 시도한다."""
+    for round_number in range(OVERLOAD_ROUNDS):
+        if round_number:
+            time.sleep(OVERLOAD_WAIT_SECONDS)
+        for model in MODELS:
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(response_mime_type="application/json"),
+                )
+                return response.text
+            except errors.ServerError as e:
+                logger.warning(f"[Gemini] {model} 과부하: {e.code}")
+    raise RuntimeError("Gemini 모델이 모두 과부하 상태")
+
+
 def pick_trends(client, today, excluded_ids: set, excluded_names: set, naver_id: str, naver_secret: str) -> list:
     """
     새 트렌드 목록을 반환한다.
@@ -210,13 +232,9 @@ def pick_trends(client, today, excluded_ids: set, excluded_names: set, naver_id:
     prompt_names = list(excluded_names)
     failure = ""
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        response = client.models.generate_content(
-            model=MODEL,
-            contents=build_prompt(today, prompt_names, evidence),
-            config=types.GenerateContentConfig(response_mime_type="application/json"),
-        )
+        raw = generate(client, build_prompt(today, prompt_names, evidence))
         try:
-            cleaned = clean_trends(parse_trends(response.text), excluded_ids, excluded_names, evidence)
+            cleaned = clean_trends(parse_trends(raw), excluded_ids, excluded_names, evidence)
         except ValueError as e:
             failure = str(e)
             logger.warning(f"트렌드 생성 {attempt}회차 실패: {failure}")
