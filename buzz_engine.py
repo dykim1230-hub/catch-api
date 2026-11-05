@@ -12,7 +12,7 @@ import requests
 logger = logging.getLogger(__name__)
 
 NAVER_MAX_GROUPS = 5
-NAVER_PERIOD_DAYS = 8  # startDate~endDate 양 끝 포함
+NAVER_WEEKS = 8
 WEIGHTS = {"google": 0.60, "naver": 0.40}
 
 
@@ -36,26 +36,29 @@ def get_google_signal(trend: dict) -> float:
         return -1.0
 
 
-def get_naver_signals(trends: list, client_id: str, client_secret: str) -> list:
+def get_naver_weekly(trends: list, client_id: str, client_secret: str) -> list:
     """
-    Naver DataLab 7일 평균 (0-100). 실패·미수집 트렌드는 -1.
-    DataLab 비율은 요청 안의 최댓값이 100인 상대값이라, 트렌드끼리 비교하려면
-    한 요청에 함께 넣어야 한다. 한 요청 최대 5그룹이므로 초과분은 수집하지 않는다.
+    Naver DataLab 주간 평균 목록(오래된 주 → 최근 주, 0-100). 이번 주 데이터가 없으면 None.
+    DataLab 비율은 요청 안의 최댓값이 100인 상대값이라, 다른 요청의 값과 비교할 수 없다.
+    그래서 트렌드들과 여러 주를 한 요청에 함께 넣어 같은 기준의 값을 받는다.
+    한 요청 최대 5그룹이므로 초과분은 수집하지 않는다.
     """
-    signals = [-1.0] * len(trends)
+    weekly = [None] * len(trends)
     if not client_id or not client_secret:
-        return signals
+        return weekly
     targets = [(i, t) for i, t in enumerate(trends) if t.get("naver_kw")]
     if len(targets) > NAVER_MAX_GROUPS:
         logger.warning(f"[Naver DataLab] 트렌드 {len(targets)}개 중 {NAVER_MAX_GROUPS}개만 수집")
         targets = targets[:NAVER_MAX_GROUPS]
     if not targets:
-        return signals
+        return weekly
     try:
-        today = date.today()
+        # 오늘은 아직 집계 중이라 어제까지만 본다
+        end = date.today() - timedelta(days=1)
+        start = end - timedelta(days=NAVER_WEEKS * 7 - 1)
         body = {
-            "startDate": (today - timedelta(days=NAVER_PERIOD_DAYS - 1)).strftime("%Y-%m-%d"),
-            "endDate": today.strftime("%Y-%m-%d"),
+            "startDate": start.strftime("%Y-%m-%d"),
+            "endDate": end.strftime("%Y-%m-%d"),
             "timeUnit": "date",
             "keywordGroups": [
                 {"groupName": t["id"], "keywords": t["naver_kw"][:5]} for _, t in targets
@@ -74,13 +77,20 @@ def get_naver_signals(trends: list, client_id: str, client_secret: str) -> list:
         r.raise_for_status()
         by_id = {item["title"]: item["data"] for item in r.json().get("results", [])}
         for i, t in targets:
-            ratios = [point["ratio"] for point in by_id.get(t["id"], [])]
-            if ratios:
-                # 검색량이 없는 날은 응답에서 빠지므로 기간 전체 일수로 나눈다
-                signals[i] = float(sum(ratios) / NAVER_PERIOD_DAYS)
+            totals = [0.0] * NAVER_WEEKS
+            has_this_week = False
+            for point in by_id.get(t["id"], []):
+                days_ago = (end - date.fromisoformat(point["period"])).days
+                week = NAVER_WEEKS - 1 - days_ago // 7
+                if 0 <= week < NAVER_WEEKS:
+                    totals[week] += point["ratio"]
+                    has_this_week = has_this_week or week == NAVER_WEEKS - 1
+            if has_this_week:
+                # 검색량이 없는 날은 응답에서 빠지므로 7일로 나눈다
+                weekly[i] = [total / 7 for total in totals]
     except Exception as e:
         logger.warning(f"[Naver DataLab] {e}")
-    return signals
+    return weekly
 
 
 # ── 점수 계산 ────────────────────────────────────────────────────────
@@ -126,22 +136,29 @@ def run_buzz_update(prev_data: dict, trends_config: list):
         google_raw.append(get_google_signal(trend))
         time.sleep(2)
 
-    naver_raw = get_naver_signals(trends_config, naver_id, naver_secret)
+    naver_weekly = get_naver_weekly(trends_config, naver_id, naver_secret)
 
     results, insufficient = [], []
     for i, trend in enumerate(trends_config):
-        signals = {"google": google_raw[i], "naver": naver_raw[i]}
+        weeks = naver_weekly[i]
+        signals = {"google": google_raw[i], "naver": weeks[-1] if weeks else -1.0}
         score = compute_score(signals)
         if score is None:
             insufficient.append(trend["id"])
             continue
 
-        prev_score = prev_data.get(trend["id"], {}).get("score", score)
-        delta = round(score - prev_score)
-        status, status_label = compute_status(score, delta)
+        if weeks:
+            # 네이버 값은 이전 문서와 비교할 수 없어 같은 응답의 주간 값으로 추이를 만든다.
+            # 과거 주의 다른 신호는 알 수 없어 이번 값으로 고정한다.
+            history = [compute_score({**signals, "naver": week}) for week in weeks]
+            delta = history[-1] - history[-2]
+        else:
+            prev_score = prev_data.get(trend["id"], {}).get("score", score)
+            delta = round(score - prev_score)
+            prev_history = prev_data.get(trend["id"], {}).get("history", [])
+            history = (prev_history[-6:] if prev_history else []) + [score]
 
-        prev_history = prev_data.get(trend["id"], {}).get("history", [])
-        history = (prev_history[-6:] if prev_history else []) + [score]
+        status, status_label = compute_status(score, delta)
 
         results.append({
             "id":           trend["id"],
