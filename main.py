@@ -265,7 +265,7 @@ async def refresh_trends(request: Request, dry_run: bool = False):
 
 @app.post("/debug/gemini")
 async def debug_gemini(request: Request):
-    """임시 진단용: 모델과 검색 조합별 Gemini 호출 결과만 반환한다. 저장하지 않는다."""
+    """임시 진단용(2차): 모델별 Google 검색 호출 결과만 반환한다. 저장하지 않는다."""
     expected = os.environ.get("CRON_SECRET", "")
     if not expected or request.headers.get("X-Cron-Token", "") != expected:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -278,10 +278,10 @@ async def debug_gemini(request: Request):
 
     results = []
     for model, search in [
-        ("gemini-3.6-flash", False),
-        ("gemini-3.6-flash", True),
-        ("gemini-2.5-flash", False),
-        ("gemini-2.5-flash", True),
+        ("gemini-3.5-flash", True),
+        ("gemini-3.7-flash", True),
+        ("gemini-3.8-flash", True),
+        ("gemini-flash-latest", True),
     ]:
         config = google_genai.types.GenerateContentConfig(
             tools=[google_genai.types.Tool(google_search=google_genai.types.GoogleSearch())] if search else None,
