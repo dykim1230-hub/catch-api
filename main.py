@@ -17,7 +17,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore as fs
 import google.genai as google_genai
 
-from buzz_engine import run_buzz_update, _DIAG
+from buzz_engine import run_buzz_update
 from trend_picker import pick_trends
 
 logging.basicConfig(level=logging.INFO)
@@ -198,7 +198,7 @@ async def cron_update(request: Request):
         })
 
         logger.info(f"Buzz update 완료: { {t['id']: t['score'] for t in trends} }")
-        return {"status": "ok", "date": today, "trends": trends, "insufficient_data": insufficient, "diag": _DIAG}
+        return {"status": "ok", "date": today, "trends": trends, "insufficient_data": insufficient}
     except HTTPException:
         raise
     except Exception as e:

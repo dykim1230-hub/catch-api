@@ -32,7 +32,6 @@ YOUTUBE_FULL_SCALE = 100  # 한 주 영상 수가 이만큼이면 100점 (실제
 SEARCH_SPLIT = {"google": 0.60, "naver": 0.40}
 WEIGHTS = {"search": 0.50, "blog": 0.30, "youtube": 0.20}
 TAG_PATTERN = re.compile(r"<[^>]+>")
-_DIAG = {}  # 임시 진단: /cron/update 응답으로만 내보낸다
 
 
 # ── 신호 수집 함수 ────────────────────────────────────────────────────────────
@@ -221,7 +220,6 @@ def _blog_posts(keyword: str, oldest: date, headers: dict) -> tuple:
     API는 1,000번째 글까지만 주므로, 그 전에 끊기면 마지막 날은 일부만 읽은 것으로 보고 뺀다.
     """
     posts, reached = {}, None
-    stats = _DIAG.setdefault("blog", {}).setdefault(keyword, {"read": 0, "matched": 0, "reached": None, "sample": []})
     for start in range(1, BLOG_MAX_START + 1, BLOG_PAGE_SIZE):
         r = requests.get(
             BLOG_URL,
@@ -232,18 +230,13 @@ def _blog_posts(keyword: str, oldest: date, headers: dict) -> tuple:
         r.raise_for_status()
         items = r.json().get("items", [])
         for item in items:
-            stats["read"] += 1
-            if len(stats["sample"]) < 3:
-                stats["sample"].append(_compact(item.get("title"))[:40])
             try:
                 posted = datetime.strptime(item.get("postdate", ""), "%Y%m%d").date()
             except ValueError:
                 continue
             reached = posted
-            stats["reached"] = posted.isoformat()
             if posted >= oldest and _matches(keyword, f"{item.get('title')} {item.get('description')}"):
                 posts[item["link"]] = posted
-                stats["matched"] += 1
         if len(items) < BLOG_PAGE_SIZE or (reached and reached < oldest):
             return posts, oldest
     return posts, reached + timedelta(days=1) if reached else date.max
@@ -274,7 +267,6 @@ def get_blog_weekly(trends: list, client_id: str, client_secret: str) -> list:
             # 키를 남기지 않도록 URL 없이 기록한다
             status = getattr(getattr(e, "response", None), "status_code", type(e).__name__)
             logger.warning(f"[Naver 블로그] {trend['id']}: {status}")
-            _DIAG.setdefault("errors", []).append(f"blog {trend['id']}: {status}")
             continue
         results[i] = _weekly_counts(per_keyword, end, NAVER_WEEKS, BLOG_FULL_SCALE)
     return results
@@ -298,25 +290,14 @@ def _youtube_dates(keyword: str, oldest: date, end: date, api_key: str) -> tuple
         "key": api_key,
     }
     videos = {}
-    stats = _DIAG.setdefault("youtube", {}).setdefault(
-        params["q"], {"read": 0, "matched": 0, "pages": 0, "reached": None, "total": None, "sample": []}
-    )
     for _ in range(YOUTUBE_MAX_PAGES):
         r = requests.get(YOUTUBE_URL, params=params, timeout=10)
         r.raise_for_status()
         data = r.json()
-        stats["pages"] += 1
-        stats["total"] = data.get("pageInfo", {}).get("totalResults")
         for item in data.get("items", []):
             snippet = item["snippet"]
-            published = date.fromisoformat(snippet["publishedAt"][:10])
-            stats["read"] += 1
-            stats["reached"] = published.isoformat()
-            if len(stats["sample"]) < 3:
-                stats["sample"].append(_compact(snippet.get("title"))[:40])
             if _matches(keyword, f"{snippet.get('title')} {snippet.get('description')}"):
-                videos[item["id"]["videoId"]] = published
-                stats["matched"] += 1
+                videos[item["id"]["videoId"]] = date.fromisoformat(snippet["publishedAt"][:10])
         if not data.get("nextPageToken"):
             break
         params["pageToken"] = data["nextPageToken"]
@@ -347,7 +328,6 @@ def get_youtube_weekly(trends: list, api_key: str) -> list:
             # 예외 문구에 키가 든 URL이 포함되므로 상태 코드만 남긴다
             status = getattr(getattr(e, "response", None), "status_code", type(e).__name__)
             logger.warning(f"[YouTube] {trend['id']}: {status}")
-            _DIAG.setdefault("errors", []).append(f"youtube {trend['id']}: {status}")
             continue
         counts = _weekly_counts(per_keyword, end, YOUTUBE_WEEKS, YOUTUBE_FULL_SCALE)
         results[i] = [None] * (NAVER_WEEKS - YOUTUBE_WEEKS) + counts
@@ -404,7 +384,6 @@ def run_buzz_update(prev_data: dict, trends_config: list):
     """
     naver_id      = os.environ.get("NAVER_CLIENT_ID", "")
     naver_secret  = os.environ.get("NAVER_CLIENT_SECRET", "")
-    _DIAG.clear()
 
     google_raw = []
 
