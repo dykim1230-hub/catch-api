@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
-      # 매주 그 주의 트렌드로 아이템을 바꾼다
+      # 새 후보와 지난주 아이템을 이번 주 검색량으로 비교해 상위 5개를 남긴다
       - name: Call /cron/refresh-trends
         env:
           CRON_TOKEN: ${{ secrets.CRON_SECRET }}

@@ -93,6 +93,60 @@ def get_naver_weekly(trends: list, client_id: str, client_secret: str) -> list:
     return weekly
 
 
+def _naver_sums(groups: list, start: date, end: date, client_id: str, client_secret: str) -> dict:
+    """한 요청(최대 5그룹)의 그룹별 비율 합계. 응답에 없는 그룹은 0."""
+    r = requests.post(
+        "https://naverapihub.apigw.ntruss.com/search-trend/v1/search",
+        json={
+            "startDate": start.strftime("%Y-%m-%d"),
+            "endDate": end.strftime("%Y-%m-%d"),
+            "timeUnit": "date",
+            "keywordGroups": [{"groupName": t["id"], "keywords": t["naver_kw"][:5]} for t in groups],
+        },
+        headers={
+            "X-NCP-APIGW-API-KEY-ID": client_id,
+            "X-NCP-APIGW-API-KEY": client_secret,
+            "Content-Type": "application/json",
+        },
+        timeout=10,
+    )
+    r.raise_for_status()
+    sums = {t["id"]: 0.0 for t in groups}
+    for item in r.json().get("results", []):
+        sums[item["title"]] = sum(point["ratio"] for point in item.get("data", []))
+    return sums
+
+
+def get_naver_this_week(trends: list, client_id: str, client_secret: str) -> list:
+    """
+    최근 7일 검색량을 트렌드끼리 비교할 수 있는 값으로 반환한다(같은 순서, 없으면 0).
+    한 요청에 5그룹까지만 넣을 수 있어 5개가 넘으면 여러 번 요청한다.
+    DataLab 값은 요청마다 기준이 달라서, 첫 요청에서 검색량이 가장 많은 트렌드를
+    기준으로 삼아 나머지 요청에 함께 넣고 그 값의 비율로 맞춘다.
+    """
+    targets = [t for t in trends if t.get("naver_kw")]
+    if not client_id or not client_secret or not targets:
+        return [0.0] * len(trends)
+    end = date.today() - timedelta(days=1)
+    start = end - timedelta(days=6)
+    first = targets[:NAVER_MAX_GROUPS]
+    values = _naver_sums(first, start, end, client_id, client_secret)
+    anchor = max(first, key=lambda t: values[t["id"]])
+    anchor_value = values[anchor["id"]]
+    rest = targets[NAVER_MAX_GROUPS:]
+    if rest and anchor_value <= 0:
+        raise RuntimeError("기준 트렌드의 검색량이 0이라 비교할 수 없음")
+    for k in range(0, len(rest), NAVER_MAX_GROUPS - 1):
+        chunk = rest[k:k + NAVER_MAX_GROUPS - 1]
+        sums = _naver_sums([anchor] + chunk, start, end, client_id, client_secret)
+        if sums[anchor["id"]] <= 0:
+            raise RuntimeError("기준 트렌드의 검색량이 0이라 비교할 수 없음")
+        scale = anchor_value / sums[anchor["id"]]
+        for t in chunk:
+            values[t["id"]] = sums[t["id"]] * scale
+    return [values.get(t["id"], 0.0) for t in trends]
+
+
 # ── 점수 계산 ────────────────────────────────────────────────────────
 
 def compute_score(signals: dict):

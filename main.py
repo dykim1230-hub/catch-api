@@ -211,7 +211,8 @@ async def cron_update(request: Request):
 @app.post("/cron/refresh-trends")
 async def refresh_trends(request: Request, dry_run: bool = False):
     """
-    네이버 뉴스·블로그 근거로 Gemini가 최근에 쓰지 않은 K-패션 트렌드를 골라 catch_config/trends 에 저장한다.
+    네이버 뉴스·블로그 근거로 Gemini가 새 후보를 고르고, 지난주 아이템과 함께
+    이번 주 네이버 검색량으로 비교해 상위 5개를 catch_config/trends 에 저장한다.
     dry_run=true 면 저장하지 않고 결과만 반환한다.
     Gemini 모델이 과부하면 다른 모델로 넘어간다.
     """
@@ -229,10 +230,13 @@ async def refresh_trends(request: Request, dry_run: bool = False):
         today = date.today()
         db = get_db()
         excluded_ids, excluded_names = load_recent_trends(db, today)
+        config = db.collection("catch_config").document("trends").get()
+        current = config.to_dict().get("trends", []) if config.exists else []
 
-        new_trends = pick_trends(
+        new_trends, ranking = pick_trends(
             google_genai.Client(api_key=api_key),
             today,
+            current,
             excluded_ids,
             excluded_names,
             os.environ.get("NAVER_CLIENT_ID", ""),
@@ -252,6 +256,7 @@ async def refresh_trends(request: Request, dry_run: bool = False):
             "dry_run": dry_run,
             "updated_date": today.isoformat(),
             "excluded_ids": sorted(excluded_ids),
+            "ranking": ranking,
             "trends": new_trends,
         }
 
