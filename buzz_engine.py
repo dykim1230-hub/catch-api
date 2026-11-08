@@ -23,7 +23,10 @@ BLOG_FULL_SCALE = 1000  # 한 주 글 수가 이만큼이면 100점 (실제 분�
 YOUTUBE_URL = "https://www.googleapis.com/youtube/v3/search"
 YOUTUBE_WEEKS = 2  # 호출 1회가 100유닛이라 변화량에 필요한 2주만 본다
 YOUTUBE_PAGE_SIZE = 50
-YOUTUBE_MAX_PAGES = 3
+YOUTUBE_MAX_PAGES = 2  # 키워드당. 호출 수 = 트렌드 × 키워드 × 페이지
+YOUTUBE_MAX_KEYWORDS = 3
+MIN_READ_DAYS = 2  # 호출 한도로 일부만 읽은 주는 이만큼 읽었을 때만 주간 값을 추정한다
+SPELLING_VARIANTS = {"재킷": "자켓", "카디건": "가디건"}
 YOUTUBE_FULL_SCALE = 100  # 한 주 영상 수가 이만큼이면 100점 (실제 분포를 보고 조정)
 # Google·네이버는 "검색" 한 묶음이라, 어느 한쪽이 없어도 검색 비중은 그대로다.
 SEARCH_SPLIT = {"google": 0.60, "naver": 0.40}
@@ -164,25 +167,51 @@ def get_naver_this_week(trends: list, client_id: str, client_secret: str) -> lis
 
 
 def _compact(text: str) -> str:
-    return re.sub(r"\s+", "", html.unescape(TAG_PATTERN.sub("", text or ""))).lower()
+    compact = re.sub(r"\s+", "", html.unescape(TAG_PATTERN.sub("", text or ""))).lower()
+    for variant, standard in SPELLING_VARIANTS.items():
+        compact = compact.replace(variant, standard)
+    return compact
 
 
-def _weekly_counts(dates, end: date, weeks: int, read_until: date, full_scale: int) -> list:
+def _matches(keyword: str, text: str) -> bool:
+    """키워드의 단어가 모두 들어 있으면 관련 글로 본다. 검색 결과에 무관한 글이 많아 거른다."""
+    compact = _compact(text)
+    return all(_compact(word) in compact for word in keyword.split())
+
+
+def _keyword_weekly(dates, end: date, weeks: int, read_until: date, full_scale: int) -> list:
     """
-    날짜 목록을 주별 개수(오래된 주 → 최근 주)로 묶는다.
-    read_until 이전이 포함되어 끝까지 못 읽은 주는 None이다. 단 이미 만점 기준을 넘긴 주는 값을 유지한다.
+    한 키워드의 날짜 목록을 주별 개수(오래된 주 → 최근 주)로 묶는다.
+    호출 한도로 일부만 읽은 주는 읽은 날들의 하루 평균으로 추정하고,
+    MIN_READ_DAYS일도 못 읽었으면 None이다. 단 이미 만점 기준을 넘긴 주는 값을 유지한다.
     """
-    counts = [0] * weeks
+    seen, complete = [0] * weeks, [0] * weeks
     for day in dates:
         week = weeks - 1 - (end - day).days // 7
         if 0 <= week < weeks:
-            counts[week] += 1
-    return [
-        count if count >= full_scale
-        or end - timedelta(days=(weeks - 1 - week) * 7 + 6) >= read_until
-        else None
-        for week, count in enumerate(counts)
-    ]
+            seen[week] += 1
+            complete[week] += day >= read_until
+    values = []
+    for week in range(weeks):
+        last_day = end - timedelta(days=(weeks - 1 - week) * 7)
+        first_day = last_day - timedelta(days=6)
+        days_read = (last_day - read_until).days + 1
+        if first_day >= read_until:
+            values.append(seen[week])
+        elif days_read >= MIN_READ_DAYS:
+            values.append(round(complete[week] * 7 / days_read))
+        else:
+            values.append(seen[week] if seen[week] >= full_scale else None)
+    return values
+
+
+def _weekly_counts(per_keyword: list, end: date, weeks: int, full_scale: int) -> list:
+    """per_keyword: [(날짜 목록, read_until)]. 키워드별 값을 더하고, 하나라도 모르면 그 주는 None이다."""
+    totals = [0] * weeks
+    for dates, read_until in per_keyword:
+        for week, value in enumerate(_keyword_weekly(dates, end, weeks, read_until, full_scale)):
+            totals[week] = None if value is None or totals[week] is None else totals[week] + value
+    return totals
 
 
 def _blog_posts(keyword: str, oldest: date, headers: dict) -> tuple:
@@ -192,7 +221,6 @@ def _blog_posts(keyword: str, oldest: date, headers: dict) -> tuple:
     API는 1,000번째 글까지만 주므로, 그 전에 끊기면 마지막 날은 일부만 읽은 것으로 보고 뺀다.
     """
     posts, reached = {}, None
-    target = _compact(keyword)
     stats = _DIAG.setdefault("blog", {}).setdefault(keyword, {"read": 0, "matched": 0, "reached": None, "sample": []})
     for start in range(1, BLOG_MAX_START + 1, BLOG_PAGE_SIZE):
         r = requests.get(
@@ -213,7 +241,7 @@ def _blog_posts(keyword: str, oldest: date, headers: dict) -> tuple:
                 continue
             reached = posted
             stats["reached"] = posted.isoformat()
-            if posted >= oldest and target in _compact(f"{item.get('title')} {item.get('description')}"):
+            if posted >= oldest and _matches(keyword, f"{item.get('title')} {item.get('description')}"):
                 posts[item["link"]] = posted
                 stats["matched"] += 1
         if len(items) < BLOG_PAGE_SIZE or (reached and reached < oldest):
@@ -237,30 +265,29 @@ def get_blog_weekly(trends: list, client_id: str, client_secret: str) -> list:
         if not keywords:
             continue
         try:
-            posts, read_until = {}, oldest
+            per_keyword, seen_links = [], set()
             for keyword in keywords:
                 found, reached = _blog_posts(keyword, oldest, headers)
-                posts.update(found)
-                read_until = max(read_until, reached)
+                per_keyword.append(([d for link, d in found.items() if link not in seen_links], reached))
+                seen_links.update(found)
         except (requests.RequestException, ValueError) as e:
             # 키를 남기지 않도록 URL 없이 기록한다
             status = getattr(getattr(e, "response", None), "status_code", type(e).__name__)
             logger.warning(f"[Naver 블로그] {trend['id']}: {status}")
             _DIAG.setdefault("errors", []).append(f"blog {trend['id']}: {status}")
             continue
-        results[i] = _weekly_counts(posts.values(), end, NAVER_WEEKS, read_until, BLOG_FULL_SCALE)
+        results[i] = _weekly_counts(per_keyword, end, NAVER_WEEKS, BLOG_FULL_SCALE)
     return results
 
 
-def _youtube_dates(keywords: list, oldest: date, end: date, api_key: str) -> tuple:
+def _youtube_dates(keyword: str, oldest: date, end: date, api_key: str) -> tuple:
     """
     최신순으로 받은 영상 중 제목·설명에 키워드가 들어간 것을 모은다.
     반환: ({영상 id: 게시일}, 빠짐없이 읽은 가장 오래된 날짜). 호출마다 100유닛이라 페이지 수를 제한한다.
     """
-    targets = [_compact(k) for k in keywords]
     params = {
         "part": "snippet",
-        "q": "|".join(keywords),
+        "q": keyword,
         "type": "video",
         "order": "date",
         "regionCode": "KR",
@@ -288,8 +315,7 @@ def _youtube_dates(keywords: list, oldest: date, end: date, api_key: str) -> tup
             stats["reached"] = published.isoformat()
             if len(stats["sample"]) < 3:
                 stats["sample"].append(_compact(snippet.get("title"))[:40])
-            text = _compact(f"{snippet.get('title')} {snippet.get('description')}")
-            if any(target in text for target in targets):
+            if _matches(keyword, f"{snippet.get('title')} {snippet.get('description')}"):
                 videos[item["id"]["videoId"]] = published
                 stats["matched"] += 1
         if not data.get("nextPageToken"):
@@ -309,18 +335,22 @@ def get_youtube_weekly(trends: list, api_key: str) -> list:
     end = date.today() - timedelta(days=1)
     oldest = end - timedelta(days=YOUTUBE_WEEKS * 7 - 1)
     for i, trend in enumerate(trends):
-        keywords = trend.get("naver_kw", [])[:5]
+        keywords = trend.get("naver_kw", [])[:YOUTUBE_MAX_KEYWORDS]
         if not keywords:
             continue
         try:
-            videos, read_until = _youtube_dates(keywords, oldest, end, api_key)
+            per_keyword, seen_ids = [], set()
+            for keyword in keywords:
+                videos, reached = _youtube_dates(keyword, oldest, end, api_key)
+                per_keyword.append(([d for vid, d in videos.items() if vid not in seen_ids], reached))
+                seen_ids.update(videos)
         except (requests.RequestException, ValueError, KeyError) as e:
             # 예외 문구에 키가 든 URL이 포함되므로 상태 코드만 남긴다
             status = getattr(getattr(e, "response", None), "status_code", type(e).__name__)
             logger.warning(f"[YouTube] {trend['id']}: {status}")
             _DIAG.setdefault("errors", []).append(f"youtube {trend['id']}: {status}")
             continue
-        counts = _weekly_counts(videos.values(), end, YOUTUBE_WEEKS, read_until, YOUTUBE_FULL_SCALE)
+        counts = _weekly_counts(per_keyword, end, YOUTUBE_WEEKS, YOUTUBE_FULL_SCALE)
         results[i] = [None] * (NAVER_WEEKS - YOUTUBE_WEEKS) + counts
     return results
 
