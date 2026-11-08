@@ -2,7 +2,8 @@
 CATCH Buzz API — FastAPI on Render
 엔드포인트:
   GET  /              헬스 체크
-  POST /cron/update   신호 수집 + Firestore 저장 (cron-job.org 호출)
+  POST /cron/update   신호 수집 + Firestore 저장 (주간 워크플로 호출)
+  POST /cron/refresh-trends  그 주의 트렌드로 아이템 교체 (주간 워크플로가 update 전에 호출)
   GET  /buzz/latest   최신 buzz 데이터 반환 (디버그용)
 """
 import os
@@ -17,7 +18,7 @@ from firebase_admin import credentials, firestore as fs
 import google.genai as google_genai
 
 from buzz_engine import run_buzz_update
-from trend_picker import normalize_name, pick_trends
+from trend_picker import pick_trends
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -233,7 +234,7 @@ async def refresh_trends(request: Request, dry_run: bool = False):
             google_genai.Client(api_key=api_key),
             today,
             excluded_ids,
-            {normalize_name(name) for name in excluded_names},
+            excluded_names,
             os.environ.get("NAVER_CLIENT_ID", ""),
             os.environ.get("NAVER_CLIENT_SECRET", ""),
         )

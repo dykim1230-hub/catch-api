@@ -8,9 +8,21 @@ on:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
+      # 매주 그 주의 트렌드로 아이템을 바꾼다
+      - name: Call /cron/refresh-trends
+        env:
+          CRON_TOKEN: ${{ secrets.CRON_SECRET }}
+        run: |
+          curl --fail-with-body --silent --show-error \
+            --max-time 600 --retry 1 --retry-delay 60 --retry-all-errors \
+            -X POST -H "X-Cron-Token: $CRON_TOKEN" \
+            https://catch-api-xin9.onrender.com/cron/refresh-trends
+
+      # 교체가 실패해도 기존 아이템으로 점수는 갱신한다 (실행은 실패로 표시됨)
       - name: Call /cron/update
+        if: always()
         env:
           CRON_TOKEN: ${{ secrets.CRON_SECRET }}
         run: |
