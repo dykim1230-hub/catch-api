@@ -165,7 +165,11 @@ Pick {NEW_CANDIDATES} distinct K-fashion trends that these snippets show are pop
 Every trend must cite the ids of the snippets that support it, including at least {MIN_NEWS_OUTLETS} news snippets
 from different outlets (the second column). Only cite snippets that are actually about that trend.
 Skip anything the snippets do not support.
-Ignore plain product ads and single-brand promotions.
+Ignore plain product ads, single-brand promotions, and event or photo-call news.
+Each trend must be one specific item, silhouette, color, or styling (e.g. cropped puffer, wide-leg pants),
+not a broad category like streetwear, casual, minimal, or athleisure.
+Trends are ranked by the search volume of "naver_kw", so naver_kw must be specific Korean terms for that exact look.
+Never use broad terms such as 스트릿 패션, 데일리룩, 코디, 패션, 아우터 alone.
 
 Do not include these current or recently used trends or close variations of them: {excluded}
 
