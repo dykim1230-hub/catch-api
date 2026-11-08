@@ -2,7 +2,7 @@ name: Weekly buzz update
 
 on:
   schedule:
-    - cron: '5 0 * * 0'  # 매주 일요일 00:05 UTC (09:05 KST)
+    - cron: '0 0 * * 0'  # 매주 일요일 09:00 KST (= 일요일 00:00 UTC, GitHub cron은 UTC만 지원)
   workflow_dispatch:
 
 jobs:
