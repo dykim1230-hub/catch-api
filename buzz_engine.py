@@ -174,9 +174,9 @@ def _compact(text: str) -> str:
 
 
 def _matches(keyword: str, text: str) -> bool:
-    """키워드의 단어가 모두 들어 있으면 관련 글로 본다. 검색 결과에 무관한 글이 많아 거른다."""
-    compact = _compact(text)
-    return all(_compact(word) in compact for word in keyword.split())
+    """키워드 단어가 순서대로 가까이(8자 이내) 있어야 관련 글로 본다. 검색 결과에 무관한 글이 많아 거른다."""
+    pattern = ".{0,8}".join(re.escape(_compact(word)) for word in keyword.split())
+    return re.search(pattern, _compact(text)) is not None
 
 
 def _keyword_weekly(dates, end: date, weeks: int, read_until: date, full_scale: int) -> list:
@@ -282,14 +282,14 @@ def get_blog_weekly(trends: list, client_id: str, client_secret: str) -> list:
 
 def _youtube_dates(keyword: str, oldest: date, end: date, api_key: str) -> tuple:
     """
-    최신순으로 받은 영상 중 제목·설명에 키워드가 들어간 것을 모은다.
-    반환: ({영상 id: 게시일}, 빠짐없이 읽은 가장 오래된 날짜). 호출마다 100유닛이라 페이지 수를 제한한다.
+    기간 안의 영상 중 제목·설명에 키워드가 들어간 것을 모은다. 반환: ({영상 id: 게시일}, oldest).
+    최신순 정렬은 결과가 일찍 끊겨 기본(관련도) 정렬을 쓴다. 호출마다 100유닛이라 페이지 수를 제한하며,
+    그 안에서 센 개수를 그대로 쓴다.
     """
     params = {
         "part": "snippet",
         "q": keyword,
         "type": "video",
-        "order": "date",
         "regionCode": "KR",
         "relevanceLanguage": "ko",
         "maxResults": YOUTUBE_PAGE_SIZE,
@@ -297,7 +297,7 @@ def _youtube_dates(keyword: str, oldest: date, end: date, api_key: str) -> tuple
         "publishedBefore": f"{(end + timedelta(days=1)).isoformat()}T00:00:00Z",
         "key": api_key,
     }
-    videos, reached = {}, None
+    videos = {}
     stats = _DIAG.setdefault("youtube", {}).setdefault(
         params["q"], {"read": 0, "matched": 0, "pages": 0, "reached": None, "total": None, "sample": []}
     )
@@ -310,7 +310,6 @@ def _youtube_dates(keyword: str, oldest: date, end: date, api_key: str) -> tuple
         for item in data.get("items", []):
             snippet = item["snippet"]
             published = date.fromisoformat(snippet["publishedAt"][:10])
-            reached = published
             stats["read"] += 1
             stats["reached"] = published.isoformat()
             if len(stats["sample"]) < 3:
@@ -319,9 +318,9 @@ def _youtube_dates(keyword: str, oldest: date, end: date, api_key: str) -> tuple
                 videos[item["id"]["videoId"]] = published
                 stats["matched"] += 1
         if not data.get("nextPageToken"):
-            return videos, oldest
+            break
         params["pageToken"] = data["nextPageToken"]
-    return videos, reached + timedelta(days=1) if reached else date.max
+    return videos, oldest
 
 
 def get_youtube_weekly(trends: list, api_key: str) -> list:
