@@ -1,19 +1,34 @@
 """
 CATCH Buzz Engine — 신호 수집 + 점수 계산
 트렌드 목록은 Firestore catch_config/trends 에서 로드됩니다 (main.py 참조).
-신호원: Naver DataLab · Google Trends
+신호원: Naver DataLab · Google Trends · Naver 블로그 글 수 · YouTube 영상 수
 """
 import os
+import re
+import html
+import math
 import time
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 import requests
 
 logger = logging.getLogger(__name__)
 
 NAVER_MAX_GROUPS = 5
 NAVER_WEEKS = 8
-WEIGHTS = {"google": 0.60, "naver": 0.40}
+BLOG_URL = "https://naverapihub.apigw.ntruss.com/search/v1/blog"
+BLOG_PAGE_SIZE = 100
+BLOG_MAX_START = 1000
+BLOG_FULL_SCALE = 1000  # 한 주 글 수가 이만큼이면 100점 (실제 분포를 보고 조정)
+YOUTUBE_URL = "https://www.googleapis.com/youtube/v3/search"
+YOUTUBE_WEEKS = 2  # 호출 1회가 100유닛이라 변화량에 필요한 2주만 본다
+YOUTUBE_PAGE_SIZE = 50
+YOUTUBE_MAX_PAGES = 3
+YOUTUBE_FULL_SCALE = 100  # 한 주 영상 수가 이만큼이면 100점 (실제 분포를 보고 조정)
+# Google·네이버는 "검색" 한 묶음이라, 어느 한쪽이 없어도 검색 비중은 그대로다.
+SEARCH_SPLIT = {"google": 0.60, "naver": 0.40}
+WEIGHTS = {"search": 0.50, "blog": 0.30, "youtube": 0.20}
+TAG_PATTERN = re.compile(r"<[^>]+>")
 
 
 # ── 신호 수집 함수 ────────────────────────────────────────────────────────────
@@ -147,15 +162,175 @@ def get_naver_this_week(trends: list, client_id: str, client_secret: str) -> lis
     return [values.get(t["id"], 0.0) for t in trends]
 
 
+def _compact(text: str) -> str:
+    return re.sub(r"\s+", "", html.unescape(TAG_PATTERN.sub("", text or ""))).lower()
+
+
+def _weekly_counts(dates, end: date, weeks: int, read_until: date, full_scale: int) -> list:
+    """
+    날짜 목록을 주별 개수(오래된 주 → 최근 주)로 묶는다.
+    read_until 이전이 포함되어 끝까지 못 읽은 주는 None이다. 단 이미 만점 기준을 넘긴 주는 값을 유지한다.
+    """
+    counts = [0] * weeks
+    for day in dates:
+        week = weeks - 1 - (end - day).days // 7
+        if 0 <= week < weeks:
+            counts[week] += 1
+    return [
+        count if count >= full_scale
+        or end - timedelta(days=(weeks - 1 - week) * 7 + 6) >= read_until
+        else None
+        for week, count in enumerate(counts)
+    ]
+
+
+def _blog_posts(keyword: str, oldest: date, headers: dict) -> tuple:
+    """
+    keyword가 제목·요약에 실제로 들어간 글을 최신순으로 oldest까지 모은다.
+    반환: ({링크: 작성일}, 글을 빠짐없이 읽은 가장 오래된 날짜). 끝까지 읽었으면 oldest.
+    API는 1,000번째 글까지만 주므로, 그 전에 끊기면 마지막 날은 일부만 읽은 것으로 보고 뺀다.
+    """
+    posts, reached = {}, None
+    target = _compact(keyword)
+    for start in range(1, BLOG_MAX_START + 1, BLOG_PAGE_SIZE):
+        r = requests.get(
+            BLOG_URL,
+            params={"query": keyword, "display": BLOG_PAGE_SIZE, "start": start, "sort": "date"},
+            headers=headers,
+            timeout=10,
+        )
+        r.raise_for_status()
+        items = r.json().get("items", [])
+        for item in items:
+            try:
+                posted = datetime.strptime(item.get("postdate", ""), "%Y%m%d").date()
+            except ValueError:
+                continue
+            reached = posted
+            if posted >= oldest and target in _compact(f"{item.get('title')} {item.get('description')}"):
+                posts[item["link"]] = posted
+        if len(items) < BLOG_PAGE_SIZE or (reached and reached < oldest):
+            return posts, oldest
+    return posts, reached + timedelta(days=1) if reached else date.max
+
+
+def get_blog_weekly(trends: list, client_id: str, client_secret: str) -> list:
+    """
+    트렌드별 주간 블로그 글 수(오래된 주 → 최근 주). 수집에 실패하면 None.
+    """
+    results = [None] * len(trends)
+    if not client_id or not client_secret:
+        return results
+    headers = {"X-NCP-APIGW-API-KEY-ID": client_id, "X-NCP-APIGW-API-KEY": client_secret}
+    # 오늘은 아직 집계 중이라 어제까지만 본다 (DataLab 주 구분과 동일)
+    end = date.today() - timedelta(days=1)
+    oldest = end - timedelta(days=NAVER_WEEKS * 7 - 1)
+    for i, trend in enumerate(trends):
+        keywords = trend.get("naver_kw", [])[:5]
+        if not keywords:
+            continue
+        try:
+            posts, read_until = {}, oldest
+            for keyword in keywords:
+                found, reached = _blog_posts(keyword, oldest, headers)
+                posts.update(found)
+                read_until = max(read_until, reached)
+        except (requests.RequestException, ValueError) as e:
+            # 키를 남기지 않도록 URL 없이 기록한다
+            status = getattr(getattr(e, "response", None), "status_code", type(e).__name__)
+            logger.warning(f"[Naver 블로그] {trend['id']}: {status}")
+            continue
+        results[i] = _weekly_counts(posts.values(), end, NAVER_WEEKS, read_until, BLOG_FULL_SCALE)
+    return results
+
+
+def _youtube_dates(keywords: list, oldest: date, end: date, api_key: str) -> tuple:
+    """
+    최신순으로 받은 영상 중 제목·설명에 키워드가 들어간 것을 모은다.
+    반환: ({영상 id: 게시일}, 빠짐없이 읽은 가장 오래된 날짜). 호출마다 100유닛이라 페이지 수를 제한한다.
+    """
+    targets = [_compact(k) for k in keywords]
+    params = {
+        "part": "snippet",
+        "q": "|".join(keywords),
+        "type": "video",
+        "order": "date",
+        "regionCode": "KR",
+        "relevanceLanguage": "ko",
+        "maxResults": YOUTUBE_PAGE_SIZE,
+        "publishedAfter": f"{oldest.isoformat()}T00:00:00Z",
+        "publishedBefore": f"{(end + timedelta(days=1)).isoformat()}T00:00:00Z",
+        "key": api_key,
+    }
+    videos, reached = {}, None
+    for _ in range(YOUTUBE_MAX_PAGES):
+        r = requests.get(YOUTUBE_URL, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        for item in data.get("items", []):
+            snippet = item["snippet"]
+            published = date.fromisoformat(snippet["publishedAt"][:10])
+            reached = published
+            text = _compact(f"{snippet.get('title')} {snippet.get('description')}")
+            if any(target in text for target in targets):
+                videos[item["id"]["videoId"]] = published
+        if not data.get("nextPageToken"):
+            return videos, oldest
+        params["pageToken"] = data["nextPageToken"]
+    return videos, reached + timedelta(days=1) if reached else date.max
+
+
+def get_youtube_weekly(trends: list, api_key: str) -> list:
+    """
+    트렌드별 주간 영상 수. 길이는 NAVER_WEEKS로 맞추고 보지 않은 과거 주는 None이다.
+    수집에 실패하면 None. totalResults는 추정치라 영상을 직접 센다.
+    """
+    results = [None] * len(trends)
+    if not api_key:
+        return results
+    end = date.today() - timedelta(days=1)
+    oldest = end - timedelta(days=YOUTUBE_WEEKS * 7 - 1)
+    for i, trend in enumerate(trends):
+        keywords = trend.get("naver_kw", [])[:5]
+        if not keywords:
+            continue
+        try:
+            videos, read_until = _youtube_dates(keywords, oldest, end, api_key)
+        except (requests.RequestException, ValueError, KeyError) as e:
+            # 예외 문구에 키가 든 URL이 포함되므로 상태 코드만 남긴다
+            status = getattr(getattr(e, "response", None), "status_code", type(e).__name__)
+            logger.warning(f"[YouTube] {trend['id']}: {status}")
+            continue
+        counts = _weekly_counts(videos.values(), end, YOUTUBE_WEEKS, read_until, YOUTUBE_FULL_SCALE)
+        results[i] = [None] * (NAVER_WEEKS - YOUTUBE_WEEKS) + counts
+    return results
+
+
+def _log_score(count: int, full_scale: int) -> float:
+    """개수를 고정 기준의 0-100으로 바꾼다. 차이가 커서 로그를 쓴다."""
+    return min(100.0, 100 * math.log10(1 + count) / math.log10(1 + full_scale))
+
+
+def blog_score(count: int) -> float:
+    return _log_score(count, BLOG_FULL_SCALE)
+
+
+def youtube_score(count: int) -> float:
+    return _log_score(count, YOUTUBE_FULL_SCALE)
+
+
 # ── 점수 계산 ────────────────────────────────────────────────────────
 
 def compute_score(signals: dict):
     """수집된 신호만 가중 평균(가중치 재분배). 신호가 하나도 없으면 None."""
-    available = {k: v for k, v in signals.items() if v >= 0}
-    if not available:
+    groups = {k: v for k, v in signals.items() if k in WEIGHTS and v >= 0}
+    search = {k: signals[k] for k in SEARCH_SPLIT if signals.get(k, -1.0) >= 0}
+    if search:
+        groups["search"] = sum(v * SEARCH_SPLIT[k] for k, v in search.items()) / sum(SEARCH_SPLIT[k] for k in search)
+    if not groups:
         return None
-    total = sum(WEIGHTS[k] for k in available)
-    return round(sum(v * WEIGHTS[k] for k, v in available.items()) / total)
+    total = sum(WEIGHTS[k] for k in groups)
+    return round(sum(v * WEIGHTS[k] for k, v in groups.items()) / total)
 
 
 def compute_status(score: float, delta: float):
@@ -191,20 +366,42 @@ def run_buzz_update(prev_data: dict, trends_config: list):
         time.sleep(2)
 
     naver_weekly = get_naver_weekly(trends_config, naver_id, naver_secret)
+    blog_weekly = get_blog_weekly(trends_config, naver_id, naver_secret)
+    youtube_weekly = get_youtube_weekly(trends_config, os.environ.get("YOUTUBE_API_KEY", ""))
 
     results, insufficient = [], []
     for i, trend in enumerate(trends_config):
         weeks = naver_weekly[i]
-        signals = {"google": google_raw[i], "naver": weeks[-1] if weeks else -1.0}
-        score = compute_score(signals)
-        if score is None:
+        blog_counts = blog_weekly[i]
+        blog_posts = blog_counts[-1] if blog_counts else None
+        youtube_counts = youtube_weekly[i]
+        youtube_videos = youtube_counts[-1] if youtube_counts else None
+        search ={"google": google_raw[i], "naver": weeks[-1] if weeks else -1.0}
+        # 이번 주 검색 신호가 없는 트렌드는 글 수만으로 피드에 올리지 않는다
+        if compute_score(search) is None:
             insufficient.append(trend["id"])
             continue
+        signals = {
+            **search,
+            "blog": blog_score(blog_posts) if blog_posts is not None else -1.0,
+            "youtube": youtube_score(youtube_videos) if youtube_videos is not None else -1.0,
+        }
+        score = compute_score(signals)
 
         if weeks:
             # 네이버 값은 이전 문서와 비교할 수 없어 같은 응답의 주간 값으로 추이를 만든다.
-            # 과거 주의 다른 신호는 알 수 없어 이번 값으로 고정한다.
-            history = [compute_score({**signals, "naver": week}) for week in weeks]
+            # 과거 값을 알 수 없는 신호는 이번 값으로 고정한다.
+            blog_history = blog_counts or [None] * len(weeks)
+            youtube_history = youtube_counts or [None] * len(weeks)
+            history = [
+                compute_score({
+                    **signals,
+                    "naver": week,
+                    "blog": blog_score(posts) if posts is not None else signals["blog"],
+                    "youtube": youtube_score(videos) if videos is not None else signals["youtube"],
+                })
+                for week, posts, videos in zip(weeks, blog_history, youtube_history)
+            ]
             delta = history[-1] - history[-2]
         else:
             prev_score = prev_data.get(trend["id"], {}).get("score", score)
@@ -226,6 +423,8 @@ def run_buzz_update(prev_data: dict, trends_config: list):
             "status_label": status_label,
             "history":      history,
             "signals": {k: round(v, 1) for k, v in signals.items()},
+            "blog_posts":   blog_posts,
+            "youtube_videos": youtube_videos,
         })
 
     results.sort(key=lambda x: x["score"], reverse=True)

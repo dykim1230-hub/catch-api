@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '0 0 * * 0'  # 매주 일요일 09:00 KST (= 일요일 00:00 UTC, GitHub cron은 UTC만 지원)
   workflow_dispatch:
+    inputs:
+      skip_refresh:
+        description: '아이템 교체 없이 점수만 다시 계산'
+        type: boolean
+        default: false
 
 jobs:
   update:
@@ -12,6 +17,7 @@ jobs:
     steps:
       # 새 후보와 지난주 아이템을 이번 주 검색량으로 비교해 상위 5개를 남긴다
       - name: Call /cron/refresh-trends
+        if: ${{ !inputs.skip_refresh }}
         env:
           CRON_TOKEN: ${{ secrets.CRON_SECRET }}
         run: |
